@@ -1,0 +1,38 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+        
+      - name: Run ShellCheck
+        run: shellcheck dotfiles install
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Git
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git config --global init.defaultBranch main
+          
+      - name: Setup Bats
+        uses: mig4/setup-bats@v1
+        
+      - name: Run Bats Tests
+        run: bats tests/

@@ -46,14 +46,14 @@ sync_safety_check() {
     git fetch > /dev/null 2>&1
 
     # Check if the upstream branch is set
-    if ! git rev-parse --abbrev-ref --symbolic-full-name @{u} > /dev/null 2>&1; then
+    if ! git rev-parse --abbrev-ref --symbolic-full-name '@{u}' > /dev/null 2>&1; then
         # No remote tracking branch, assuming this is a new profile
         cd - > /dev/null
         return
     fi
     
     local remote_commit
-    remote_commit=$(git rev-parse @{u})
+    remote_commit=$(git rev-parse '@{u}')
     
     # If there's no remote commit, it's a new branch, so we are "in sync"
     if [[ -z "$remote_commit" ]]; then
@@ -71,7 +71,7 @@ sync_safety_check() {
     fi
 
     local behind_count
-    behind_count=$(git rev-list --count @..@{u})
+    behind_count=$(git rev-list --count @..'@{u}')
 
     # Out of sync, remote is ahead
     if [[ "$behind_count" -gt 0 ]]; then
@@ -86,7 +86,7 @@ sync_safety_check() {
     fi
 
     local ahead_count
-    ahead_count=$(git rev-list --count @{u}..@)
+    ahead_count=$(git rev-list --count '@{u}'..@)
 
     # Out of sync, local is ahead
     if [[ "$ahead_count" -gt 0 ]]; then
@@ -509,7 +509,7 @@ cmd_pull() {
     fi
     
     # Check if a remote tracking branch is set
-    if ! git rev-parse --abbrev-ref --symbolic-full-name @{u} > /dev/null 2>&1; then
+    if ! git rev-parse --abbrev-ref --symbolic-full-name '@{u}' > /dev/null 2>&1; then
         log_warn "No upstream branch configured for current branch. Cannot pull."
         cd - > /dev_null
         return
