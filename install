@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# --- Visual Helpers ---
+log_info() {
+    echo "$@"
+}
+
+log_warn() {
+    echo -e "\033[0;33m$*\033[0m"
+}
+
+log_error() {
+    echo -e "\033[0;31m$*\033[0m" >&2
+}
+
+log_success() {
+    echo -e "\033[1;32m$*\033[0m"
+}
+
+# --- 1. Pre-flight Checks ---
+
+# Detect OS
+OS="$(uname -s)"
+if [[ "$OS" != "Linux" && "$OS" != "Darwin" ]]; then
+    log_error "This script is only supported on Linux and macOS."
+    exit 1
+fi
+
+# Check for Git
+if ! command -v git &> /dev/null; then
+    log_error "Error: git not found. Please install git and try again."
+    exit 1
+fi
+
+# Define Paths
+REPO_URL="https://github.com/tarasshablii/dotfiles.git"
+INSTALL_DIR="$HOME/.dotfiles/bin"
+BIN_DIR="$HOME/.local/bin"
+EXECUTABLE_NAME="dotfiles" 
+
+# --- 2. Installation (Clone) ---
+
+if [ -d "$INSTALL_DIR/.git" ]; then
+    log_warn "Directory $INSTALL_DIR already exists. Pulling latest changes..."
+    git -C "$INSTALL_DIR" pull --quiet
+else
+    log_info "Cloning $REPO_URL into $INSTALL_DIR..."
+    git clone "$REPO_URL" "$INSTALL_DIR" --quiet
+fi
+
+
+# --- 3. Linking to PATH ---
+
+# Create ~/.local/bin if it doesn't exist
+mkdir -p "$BIN_DIR"
+
+# Create Symlink
+# We link the script inside the repo to ~/.local/bin/dotfiles
+TARGET_SCRIPT="$INSTALL_DIR/$EXECUTABLE_NAME"
+LINK_PATH="$BIN_DIR/$EXECUTABLE_NAME"
+
+if [ -f "$LINK_PATH" ] || [ -L "$LINK_PATH" ]; then
+    rm "$LINK_PATH"
+fi
+
+ln -sf "$TARGET_SCRIPT" "$LINK_PATH"
+
+# --- 4. PATH Configuration (Shell Detection) ---
+
+# Check if BIN_DIR is currently in the PATH
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    # Detect Shell Config File
+    SHELL_CONFIG=""
+    SHELL_NAME=$(basename "$SHELL")
+    
+    if [ "$SHELL_NAME" = "zsh" ]; then
+        # macOS default. .zprofile is better for PATHs than .zshrc usually
+        if [ -f "$HOME/.zprofile" ]; then
+            SHELL_CONFIG="$HOME/.zprofile"
+        else
+            SHELL_CONFIG="$HOME/.zshrc"
+        fi
+    elif [ "$SHELL_NAME" = "bash" ]; then
+        # Linux default usually
+        if [ -f "$HOME/.bash_profile" ]; then
+            SHELL_CONFIG="$HOME/.bash_profile"
+        else
+            SHELL_CONFIG="$HOME/.bashrc"
+        fi
+    fi
+
+    if [ -n "$SHELL_CONFIG" ]; then
+        {
+            echo ""
+            echo "# Added by dotfiles installer"
+            echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
+        } >> "$SHELL_CONFIG"
+        # shellcheck disable=SC1090
+        source "$SHELL_CONFIG"
+        log_info "Added $BIN_DIR to the PATH"
+        log_warn "Note: You may need to restart your terminal or 'source $SHELL_CONFIG' for changes to take effect."
+    else
+        log_error "Could not detect shell config. Please, add $BIN_DIR to your PATH manually."
+    fi
+fi
+
+# --- 5. Conclusion ---
+
+log_info ""
+log_success "Dotfiles successfully installed into $LINK_PATH"
+log_info ""
+dotfiles help

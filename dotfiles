@@ -1,0 +1,1134 @@
+#!/bin/bash
+
+set -euo pipefail
+
+DOTFILES_ROOT="$HOME/.dotfiles"
+TOOL_DIR="$DOTFILES_ROOT/bin"
+BACKUP_DIR="$DOTFILES_ROOT/backup"
+
+# --- Helpers ---
+NO_BACKUP_REPO="Error: Backup repository not initialized. Run 'dotfiles init' or 'dotfiles install' first."
+
+log_info() {
+    echo "$@"
+}
+
+log_warn() {
+    echo -e "\033[0;33m$*\033[0m"
+}
+
+log_error() {
+    echo -e "\033[0;31m$*\033[0m" >&2
+}
+
+log_success() {
+    echo -e "\033[1;32m$*\033[0m"
+}
+
+check_dependencies() {
+    if ! command -v git &> /dev/null; then
+        log_error "Error: 'git' is not installed. Please install it to continue."
+        exit 1
+    fi
+}
+
+sync_safety_check() {
+    local hard_check="${1:-true}" # Defaults to hard check
+
+    if [[ ! -d "$BACKUP_DIR/.git" ]]; then
+        log_error "$NO_BACKUP_REPO"
+        exit 1
+    fi
+
+    cd "$BACKUP_DIR"
+
+    # Fetch latest remote changes without merging
+    git fetch > /dev/null 2>&1
+
+    # Check if the upstream branch is set
+    if ! git rev-parse --abbrev-ref --symbolic-full-name @{u} > /dev/null 2>&1; then
+        # No remote tracking branch, assuming this is a new profile
+        cd - > /dev/null
+        return
+    fi
+    
+    local remote_commit
+    remote_commit=$(git rev-parse @{u})
+    
+    # If there's no remote commit, it's a new branch, so we are "in sync"
+    if [[ -z "$remote_commit" ]]; then
+        cd - > /dev/null
+        return
+    fi
+    
+    local local_commit
+    local_commit=$(git rev-parse @)
+
+    # In sync
+    if [[ "$local_commit" == "$remote_commit" ]]; then
+        cd - > /dev/null
+        return
+    fi
+
+    local behind_count
+    behind_count=$(git rev-list --count @..@{u})
+
+    # Out of sync, remote is ahead
+    if [[ "$behind_count" -gt 0 ]]; then
+        if $hard_check; then
+            log_error "Your local backup is behind the remote."
+            log_warn "Please, run 'dotfiles pull' to update."
+            exit 1
+        else
+            log_warn "Your local backup is behind the remote."
+            log_warn "Please, run 'dotfiles pull' to update."
+        fi
+    fi
+
+    local ahead_count
+    ahead_count=$(git rev-list --count @{u}..@)
+
+    # Out of sync, local is ahead
+    if [[ "$ahead_count" -gt 0 ]]; then
+        # Only print warning for soft check used in 'dotfiles status' command
+        if ! $hard_check; then
+            log_warn "Your local backup is ahead of remote by $ahead_count commits."
+            log_warn "Run 'dotfiles backup' to push changes."
+        fi
+    fi
+
+    cd - > /dev/null # Go back to original directory
+}
+
+profile_safety_check() {
+    if [[ ! -f "$BACKUP_DIR/.current_profile" ]]; then
+        # If the file doesn't exist, we can't check, so we assume it's fine.
+        # This case should ideally be handled by ensuring .current_profile is always created.
+        return
+    fi
+
+    local current_profile
+    current_profile=$(cat "$BACKUP_DIR/.current_profile")
+    
+    cd "$BACKUP_DIR"
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+    cd - > /dev/null
+
+    if [[ "$current_branch" != "$current_profile" ]]; then
+        log_warn "You are on branch '$current_branch', but the last applied profile was '$current_profile'."
+        read -p "Do you want to continue? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Aborting."
+            exit 1
+        fi
+        echo "$current_branch" > "$BACKUP_DIR/.current_profile"
+        log_info "Profile updated to '$current_branch'."
+    fi
+}
+
+has_drift_inconsistencies() {
+    local inconsistencies=false
+
+    if [[ ! -d "$BACKUP_DIR/.git" ]]; then
+        echo "false"
+        return
+    fi
+
+    cd "$BACKUP_DIR"
+    local tracked_files
+    tracked_files=$(git ls-tree -r HEAD --name-only files/)
+    cd - > /dev/null
+
+    if [[ -z "$tracked_files" ]]; then
+        echo "false"
+        return
+    fi
+    
+    while IFS= read -r backup_file_path; do
+        local relative_path="${backup_file_path#files/}"
+        local home_file_path="$HOME/$relative_path"
+        local full_backup_file_path="$BACKUP_DIR/$backup_file_path"
+
+        if [[ ! -e "$home_file_path" ]]; then
+            inconsistencies=true
+            break
+        elif ! diff -q "$full_backup_file_path" "$home_file_path" >/dev/null 2>&1; then
+            inconsistencies=true
+            break
+        fi
+    done <<< "$tracked_files"
+
+    echo "$inconsistencies"
+}
+
+get_script_dir() {
+    local script_path="${BASH_SOURCE[0]}"
+    local script_dir
+    
+    # Loop to resolve the path if the script is a symbolic link
+    while [ -h "$script_path" ]; do
+        # Get the directory of the symlink
+        script_dir="$( cd -P "$( dirname "$script_path" )" && pwd )"
+        # Get the path the symlink points to
+        script_path="$(readlink "$script_path")"
+        # If the path is relative, resolve it against the symlink's directory
+        [[ $script_path != /* ]] && script_path="$script_dir/$script_path"
+    done
+    
+    script_dir="$( cd -P "$( dirname "$script_path" )" && pwd )"
+    
+    echo "$script_dir"
+    return 0
+}
+
+get_script_version() {
+    local script_dir
+    script_dir=$(get_script_dir) 
+    
+    if [ -d "$script_dir" ]; then
+        cd "$script_dir"
+        git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"
+    else
+        echo "v0.0.0"
+        return 1
+    fi
+}
+
+whats_new() {
+    local current_version="$1"
+    local new_version="$2"
+
+    log_info "What's new:"
+
+    local range="${current_version}..${new_version}"
+    if [[ "$current_version" == "v0.0.0" ]] && ! git rev-parse --quiet --verify "$current_version" >/dev/null 2>&1; then
+        range="$new_version"
+    fi
+
+    # Get the commit hashes that are tagged
+    local tagged_commits
+    tagged_commits=$(git log "$range" --tags --simplify-by-decoration --pretty=format:'%H')
+
+    if [[ -z "$tagged_commits" ]]; then
+        log_info "  No new tagged releases in this update."
+        return
+    fi
+    
+    # Create an array of tags to be processed
+    local tags_to_process=()
+    while IFS= read -r commit_hash; do
+        while IFS= read -r tag_name; do
+            tags_to_process+=("$tag_name")
+        done < <(git tag --points-at "$commit_hash")
+    done <<< "$tagged_commits"
+
+    # Sort the tags based on version number
+    local sorted_tags
+    sorted_tags=$(printf '%s\n' "${tags_to_process[@]}" | sort -V)
+
+    # Display the tag messages
+    while IFS= read -r tag; do
+        local msg
+        msg=$(git tag -l --format='%(contents:subject)' "$tag")
+        if [[ -z "$msg" ]]; then
+            msg=$(git log -1 --format=%s "$tag")
+        fi
+        log_info "  - $tag: $msg"
+    done <<< "$sorted_tags"
+}
+
+
+
+# --- Command implementations ---
+cmd_init() {
+    remote_url=""
+    profile="main"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Error: --profile requires a name."
+                    exit 1
+                fi
+                profile="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -n "$remote_url" ]]; then
+                    log_error "Error: Unexpected argument '$1'."
+                    exit 1
+                fi
+                remote_url="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$remote_url" ]]; then
+        log_error "Error: Missing <remote_url> for init command."
+        cmd_help
+        exit 1
+    fi
+
+    # Safety check for existing directory
+    if [[ -d "$BACKUP_DIR" ]]; then
+        log_warn "Backup directory '$BACKUP_DIR' already exists."
+        read -p "Do you want to overwrite it? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Aborting. If you want to connect to an existing repository, consider 'dotfiles install' or 'dotfiles apply'."
+            exit 1
+        fi
+        rm -rf "$BACKUP_DIR"
+    fi
+
+    log_info "Initializing backup repository at $BACKUP_DIR..."
+    mkdir -p "$BACKUP_DIR"
+    cd "$BACKUP_DIR"
+    
+    git init > /dev/null
+    git remote add origin "$remote_url"
+    
+    # Safety check: fetch remote data and see if the branch already exists.
+    log_info "Checking remote state..."
+    git fetch origin > /dev/null 2>&1
+
+    # `ls-remote` will exit with 0 if the branch exists, and a non-zero code otherwise.
+    if git ls-remote --exit-code --heads "$remote_url" "$profile" > /dev/null 2>&1; then
+        log_error "Profile '$profile' already exists on the remote."
+        log_warn "Please, use 'dotfiles install --profile $profile <remote_url>' instead."
+        exit 1
+    fi
+
+    log_info "Creating new profile '$profile'..."
+    git checkout -q -b "$profile" > /dev/null
+    
+    echo ".current_profile" > .gitignore
+    echo "$profile" > .current_profile
+    
+    git add .
+    git commit -m "Initial commit" -m "Managed by dotfiles $(get_script_version)" > /dev/null
+    
+    log_info "Pushing to remote..."
+    git push --quiet -u origin "$profile" > /dev/null
+    
+    log_success "Backup repository initialized and linked to remote."
+    log_info "Current profile: $profile"
+}
+
+
+cmd_install() {
+    remote_url=""
+    profile="main"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Error: --profile requires a name."
+                    exit 1
+                fi
+                profile="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -n "$remote_url" ]]; then
+                    log_error "Error: Unexpected argument '$1'."
+                    exit 1
+                fi
+                remote_url="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$remote_url" ]]; then
+        log_error "Error: Missing <remote_url> for install command."
+        cmd_help
+        exit 1
+    fi
+
+    # Safety check
+    if [ -d "$BACKUP_DIR" ]; then
+        log_warn "Backup directory '$BACKUP_DIR' already exists."
+        read -p "Do you want to overwrite it? [y/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Overwriting existing directory..."
+            rm -rf "$BACKUP_DIR"
+        else
+            log_info "Aborting install. Use 'dotfiles pull' instead"
+            exit 1
+        fi
+    fi
+
+    log_info "Cloning profile '$profile' from '$remote_url'..."
+    if ! git clone --branch "$profile" "$remote_url" "$BACKUP_DIR" >/dev/null 2>&1; then
+        log_error "Failed to clone repository. Please check the URL and profile name."
+        exit 1
+    fi
+
+    cd "$BACKUP_DIR"
+    echo "$profile" > .current_profile
+    cd - > /dev/null
+
+    log_success "Successfully installed dotfiles."
+    log_info "Current profile: $profile"
+}
+
+
+cmd_apply() {
+    local force=false
+    if [[ "${1:-}" == "--force" ]]; then
+        force=true
+    fi
+
+    sync_safety_check
+    profile_safety_check
+
+    cd "$BACKUP_DIR"
+    local tracked_files
+    tracked_files=$(git ls-tree -r HEAD --name-only files/)
+    cd - > /dev/null
+
+    if [[ -z "$tracked_files" ]]; then
+        log_info "No dotfiles are tracked. Nothing to apply."
+        return
+    fi
+
+    local new_files=()
+    local conflicting_files=()
+    local identical_files=()
+
+    while IFS= read -r backup_file_path; do
+        local relative_path="${backup_file_path#files/}"
+        local home_file_path="$HOME/$relative_path"
+        local full_backup_file_path="$BACKUP_DIR/files/$relative_path"
+
+        if [[ ! -e "$home_file_path" ]]; then
+            new_files+=("$relative_path")
+        elif ! diff -q -r "$full_backup_file_path" "$home_file_path" >/dev/null 2>&1; then
+            conflicting_files+=("$relative_path")
+        else
+            identical_files+=("$relative_path")
+        fi
+    done <<< "$tracked_files"
+
+    if [[ ${#new_files[@]} -eq 0 ]] && [[ ${#conflicting_files[@]} -eq 0 ]]; then
+        log_success "All dotfiles are in sync. Nothing to do."
+        return
+    fi
+    
+    if [[ ${#new_files[@]} -gt 0 ]]; then
+        log_info "New files to be copied:"
+        for file in "${new_files[@]}"; do
+            echo "  - $file"
+        done
+    fi
+
+    if [[ ${#new_files[@]} -gt 0 ]]; then
+        log_info "Applying ${#new_files[@]} new dotfile(s)..."
+        for file in "${new_files[@]}"; do
+            local home_file_path="$HOME/$file"
+            local backup_file_path="$BACKUP_DIR/files/$file"
+            mkdir -p "$(dirname "$home_file_path")"
+            cp -R "$backup_file_path" "$home_file_path"
+            log_success "✅ Copied: $file"
+        done
+    fi
+    
+    if [[ ${#conflicting_files[@]} -gt 0 ]]; then
+        log_warn "Conflicting files found:"
+        for file in "${conflicting_files[@]}"; do
+            echo "  - $file"
+        done
+    fi
+
+    local conflict_resolution="skip"
+    if [[ ${#conflicting_files[@]} -gt 0 ]]; then
+        if [[ "$force" == true ]]; then
+            conflict_resolution="overwrite"
+            log_warn "--force flag is set. All conflicts will be overwritten."
+        else
+            read -p $'Choose how to handle conflicts: [o]verwrite all, [s]kip all? ' -n 1 -r action
+            echo
+            case "$action" in
+                o|O) conflict_resolution="overwrite" ;;
+                s|S|*) conflict_resolution="skip" ;;
+            esac
+        fi
+    fi
+
+
+    if [[ ${#conflicting_files[@]} -gt 0 ]]; then
+        case "$conflict_resolution" in
+            "overwrite")
+                log_info "Overwriting ${#conflicting_files[@]} conflicting file(s)..."
+                for file in "${conflicting_files[@]}"; do
+                    local home_file_path="$HOME/$file"
+                    local backup_file_path="$BACKUP_DIR/files/$file"
+                    rm -rf "$home_file_path"
+                    cp -R "$backup_file_path" "$home_file_path"
+                    log_success "✅ Overwritten: $file"
+                done
+                ;;
+            "skip")
+                log_info "Skipping ${#conflicting_files[@]} conflicting file(s)..."
+                ;;
+        esac
+    fi
+
+    log_success "Backed up dotfiles successfully applied to Home."
+}
+
+
+cmd_pull() {
+    
+    if [[ ! -d "$BACKUP_DIR/.git" ]]; then
+        log_error "$NO_BACKUP_REPO"
+        exit 1
+    fi
+
+    log_info "Syncing local backup with remote..."
+
+    cd "$BACKUP_DIR"
+
+    # Ensure we are on a branch before trying to pull
+    if ! git rev-parse --abbrev-ref HEAD &> /dev/null; then
+        log_error "Error: Not currently on a branch. Cannot pull."
+        cd - > /dev/null
+        exit 1
+    fi
+
+    # Fetch and pull
+    if ! git fetch --quiet origin; then
+        log_error "Error: Failed to fetch from remote."
+        cd - > /dev_null
+        exit 1
+    fi
+    
+    # Check if a remote tracking branch is set
+    if ! git rev-parse --abbrev-ref --symbolic-full-name @{u} > /dev/null 2>&1; then
+        log_warn "No upstream branch configured for current branch. Cannot pull."
+        cd - > /dev_null
+        return
+    fi
+
+
+    if ! git pull --ff-only --quiet; then
+        log_error "Error: Failed to pull changes from remote. You might have local changes that conflict, or remote has diverged."
+        log_warn "Consider stashing your changes, resolving conflicts manually, or using 'git pull'."
+        cd - > /dev/null
+        exit 1
+    fi
+
+    log_success "Local backup successfully synced with remote."
+    cd - > /dev/null
+}
+
+
+cmd_add() {
+
+    if [[ $# -eq 0 ]]; then
+        log_error "Error: Missing <path>(s) for add command."
+        cmd_help
+        exit 1
+    fi
+
+    sync_safety_check
+    profile_safety_check
+
+    local successful_adds=()
+    local failed_adds=()
+
+    for path_to_add in "$@"; do
+        # Safety: Check if file exists locally
+        if [[ ! -e "$HOME/$path_to_add" ]]; then
+            failed_adds+=("'$path_to_add': File does not exist.")
+            continue
+        fi
+
+        local full_path="$HOME/$path_to_add"
+
+        # Convert to absolute path to handle various inputs
+        if [[ -d "$full_path" ]]; then
+            full_path=$(cd "$full_path" && pwd)
+        else
+            full_path=$(cd "$(dirname "$full_path")" && pwd)/$(basename "$full_path")
+        fi
+
+        # Check if the path is within the home directory
+        if [[ "$full_path" != "$HOME"* ]]; then
+            failed_adds+=("'$path_to_add': Path is not inside the home directory.")
+            continue
+        fi
+
+        # Get path relative to home directory
+        local relative_path="${full_path#"$HOME/"}"
+        local backup_path="$BACKUP_DIR/files/$relative_path"
+
+        # Safety: Check if file already exists in backup
+        if [[ -e "$backup_path" ]]; then
+            failed_adds+=("'$relative_path': Already tracked.")
+            continue
+        fi
+
+        # Action
+        mkdir -p "$(dirname "$backup_path")"
+        cp -R "$HOME/$path_to_add" "$backup_path"
+        successful_adds+=("$relative_path")
+    done
+
+    if [[ ${#successful_adds[@]} -gt 0 ]]; then
+        cd "$BACKUP_DIR"
+        git add files
+
+        local commit_message="Start tracking"
+        for item in "${successful_adds[@]}"; do
+            commit_message+=" $item"
+        done
+
+        git commit -m "$commit_message" -m "Managed by dotfiles $(get_script_version)" > /dev/null
+        log_info "Pushing to remote..."
+        git push --quiet > /dev/null
+        cd - > /dev/null
+
+        log_success "Successfully started tracking ${#successful_adds[@]} item(s):"
+        for item in "${successful_adds[@]}"; do
+            echo "  - $item"
+        done
+    fi
+
+    if [[ ${#failed_adds[@]} -gt 0 ]]; then
+        log_error "Could not add ${#failed_adds[@]} item(s):"
+        for error in "${failed_adds[@]}"; do
+            echo "  - $error"
+        done
+    fi
+}
+
+
+cmd_rm() {
+    if [[ $# -eq 0 ]]; then
+        log_error "Error: Missing <path>(s) for rm command."
+        cmd_help
+        exit 1
+    fi
+
+    sync_safety_check
+    profile_safety_check
+
+    local successful_rms=()
+    local failed_rms=()
+
+    for path_to_rm in "$@"; do
+        local full_path="$HOME/$path_to_rm"
+        
+        if [[ -d "$full_path" ]]; then
+            full_path=$(cd "$full_path" && pwd)
+        else
+            full_path=$(cd "$(dirname "$full_path")" && pwd)/$(basename "$full_path")
+        fi
+
+        if [[ "$full_path" != "$HOME"* ]]; then
+            failed_rms+=("'$path_to_rm': Path is not inside the home directory.")
+            continue
+        fi
+        
+        local relative_path="${full_path#"$HOME/"}"
+        local backup_path="$BACKUP_DIR/files/$relative_path"
+
+        if [[ ! -e "$backup_path" ]]; then
+            failed_rms+=("'$relative_path': Not tracked.")
+            continue
+        fi
+
+        rm -rf "$backup_path"
+        successful_rms+=("$relative_path")
+    done
+
+    if [[ ${#successful_rms[@]} -gt 0 ]]; then
+        cd "$BACKUP_DIR"
+        git add files
+        
+        local commit_message="Stop tracking"
+        for item in "${successful_rms[@]}"; do
+            commit_message+=" $item"
+        done
+
+        git commit -m "$commit_message" -m "Managed by dotfiles $(get_script_version)" > /dev/null
+        log_info "Pushing to remote..."
+        git push --quiet > /dev/null
+        cd - > /dev/null
+
+        log_success "Successfully stopped tracking ${#successful_rms[@]} item(s):"
+        for item in "${successful_rms[@]}"; do
+            echo "  - $item"
+        done
+        log_warn "Your local configs were not affected"
+    fi
+
+    if [[ ${#failed_rms[@]} -gt 0 ]]; then
+        log_error "Could not remove ${#failed_rms[@]} item(s):"
+        for error in "${failed_rms[@]}"; do
+            echo "  - $error"
+        done
+    fi
+}
+
+
+cmd_backup() {
+
+    sync_safety_check
+    profile_safety_check
+
+    cd "$BACKUP_DIR"
+    local tracked_files
+    tracked_files=$(git ls-tree -r HEAD --name-only files/)
+    cd - > /dev/null
+
+    if [[ -z "$tracked_files" ]]; then
+        log_info "No files are tracked. Nothing to back up."
+        return
+    fi
+
+    local missing_files=()
+    local all_files=()
+    while IFS= read -r file; do
+        all_files+=("$file")
+    done <<< "$tracked_files"
+
+    for backup_file_path in "${all_files[@]}"; do
+        local relative_path="${backup_file_path#files/}"
+        local home_file_path="$HOME/$relative_path"
+        local full_backup_file_path="$BACKUP_DIR/$backup_file_path"
+
+        if [[ -e "$home_file_path" ]]; then
+            # remove the old backup to ensure clean copy
+            rm -rf "$full_backup_file_path"
+            # Copy from home to backup, preserving directory structure
+            mkdir -p "$(dirname "$full_backup_file_path")"
+            cp -R "$home_file_path" "$full_backup_file_path"
+        else
+            missing_files+=("$relative_path")
+        fi
+    done
+
+    if [[ ${#missing_files[@]} -gt 0 ]]; then
+        log_warn "The following tracked dotfiles not found in Home directory:"
+        for file in "${missing_files[@]}"; do
+            echo "  - $file"
+        done
+        read -p "Do you want to stop tracking them? [y/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            for file in "${missing_files[@]}"; do
+                rm -rf "$BACKUP_DIR/files/$file"
+            done
+        fi
+    fi
+
+    cd "$BACKUP_DIR"
+    git add files
+
+    if git diff-index --quiet HEAD --; then
+        log_info "No changes to back up."
+        cd - > /dev/null
+        return
+    fi
+
+    local backup_date
+    backup_date=$(date +"%Y-%m-%d %H:%M:%S %Z")
+    git commit -m "Backup $backup_date" -m "Managed by dotfiles $(get_script_version)" > /dev/null
+    log_info "Pushing to remote..."
+    git push --quiet > /dev/null
+    cd - > /dev/null
+
+    log_success "Home dotfiles successfully backed up."
+}
+
+
+cmd_status() {
+
+    # Perform soft sync safety check
+    sync_safety_check false
+
+    cd "$BACKUP_DIR"
+
+    # Current Profile
+    local current_profile="N/A"
+    if [[ -f ".current_profile" ]]; then
+        current_profile=$(cat ".current_profile")
+    fi
+    local current_branch 
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+    log_info "Current Profile: $current_profile"
+    if [[ "$current_profile" != "$current_branch" ]]; then
+        log_warn "  (⚠️ Current git branch is '$current_branch', but .current_profile is '$current_profile')"
+    fi
+
+    # Number of Tracked Files
+    local tracked_files_count 
+    tracked_files_count=$(git ls-tree -r HEAD --name-only files/ | wc -l | tr -d ' ')
+    log_info "Tracked Files: $tracked_files_count"
+
+    # Latest Backup Date
+    local latest_changes_date 
+    latest_changes_date=$(git log -1 --format=%cd --date=format:'%Y-%m-%d %H:%M:%S')
+    local latest_change
+    latest_change=$(git log -1 --pretty=format:%s)
+    log_info "Latest Change: $latest_changes_date ('$latest_change')"
+
+    cd - > /dev/null
+
+    cd "$BACKUP_DIR"
+    local tracked_files
+    tracked_files=$(git ls-tree -r HEAD --name-only files/)
+    cd - > /dev/null
+
+    # Don't run drift if no files tracked
+    if [[ -z "$tracked_files" ]]; then
+        return
+    fi
+    
+    log_info ""
+    log_info "--- Dotfiles Drift ---"
+
+    log_info "Tracked dotfiles status (Home vs. backup):"
+    echo "$tracked_files" | while read -r backup_file_path; do
+        local relative_path="${backup_file_path#files/}"
+        local home_file_path="$HOME/$relative_path"
+        local full_backup_file_path="$BACKUP_DIR/$backup_file_path"
+
+        if [[ ! -e "$home_file_path" ]]; then
+            log_error "❌ $relative_path (missing, not found in Home)"
+        elif ! diff -q "$full_backup_file_path" "$home_file_path" >/dev/null 2>&1; then
+            log_warn "⚠️ $relative_path (modified, run 'dotfiles diff')"
+        else
+            log_success "✅ $relative_path (in sync)"
+        fi
+    done
+}
+
+
+cmd_profile() {
+    local profile_name="${1:-}"
+
+    # Safety check for backup directory
+    if [[ ! -d "$BACKUP_DIR/.git" ]]; then
+        log_error "$NO_BACKUP_REPO"
+        exit 1
+    fi
+
+    if [[ -z "$profile_name" ]]; then
+        log_info "Available profiles (branches):"
+        cd "$BACKUP_DIR"
+        local current_branch
+        current_branch=$(git rev-parse --abbrev-ref HEAD)
+        git branch --list | while read -r branch; do
+            if [[ "$branch" == "*"* ]]; then
+                log_success "  ${branch##* } (current)"
+            else
+                log_info "  $branch"
+            fi
+        done
+        cd - > /dev/null
+        return
+    fi
+
+    # Profile name provided, attempt to switch
+    sync_safety_check
+
+    local has_drift
+    has_drift=$(has_drift_inconsistencies)
+
+    if [[ "$has_drift" == "true" ]]; then
+        log_warn "Inconsistencies detected between your Home directory and the backup."
+        log_info "Run 'dotfile status' or 'dotfiles diff' for more details."
+        read -p "Do you want to continue with the profile switch? This might lead to data loss if you haven't backed up. [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Aborting profile switch."
+            exit 1
+        fi
+    fi
+
+    cd "$BACKUP_DIR"
+    local branch_exists
+    branch_exists=$(git branch --list "$profile_name")
+
+    if [[ -n "$branch_exists" ]]; then
+        log_info "Switching to existing profile '$profile_name'..."
+        git checkout -q "$profile_name" > /dev/null
+        echo "$profile_name" > .current_profile
+        log_success "Successfully switched to profile '$profile_name'."
+    else
+        log_warn "Profile '$profile_name' does not exist locally."
+        read -p "Do you want to create a new profile '$profile_name'? [y/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Creating and switching to new profile '$profile_name'..."
+
+            local initial_commit
+            initial_commit=$(git rev-list --max-parents=0 HEAD | tail -n 1)
+
+            if [[ -n "$initial_commit" ]]; then
+                git checkout -q -b "$profile_name" "$initial_commit" > /dev/null
+            else
+                git checkout -q -b "$profile_name" > /dev/null
+            fi
+
+            echo "$profile_name" > .current_profile
+            log_info "Pushing new profile to remote..."
+            git push --quiet --set-upstream origin "$profile_name" > /dev/null 2>&1
+            log_success "Successfully created and switched to profile '$profile_name'."
+        else
+            log_info "Aborting profile creation."
+            exit 1
+        fi
+    fi
+
+    cd - > /dev/null
+}
+
+
+cmd_diff() {
+    # Safety check for backup directory
+    if [[ ! -d "$BACKUP_DIR/.git" ]]; then
+        log_error "$NO_BACKUP_REPO"
+        exit 1
+    fi
+
+    cd "$BACKUP_DIR"
+    local tracked_files
+    tracked_files=$(git ls-tree -r HEAD --name-only files/)
+    cd - > /dev/null
+
+    if [[ -z "$tracked_files" ]]; then
+        log_info "No files are tracked. Nothing to diff."
+        return
+    fi
+
+    local has_diff=false
+    while IFS= read -r backup_file_path; do
+        local relative_path="${backup_file_path#files/}"
+        local home_file_path="$HOME/$relative_path"
+        local full_backup_file_path="$BACKUP_DIR/$backup_file_path"
+
+        if [[ -e "$home_file_path" ]] && ! diff -q "$full_backup_file_path" "$home_file_path" >/dev/null 2>&1; then
+            has_diff=true
+            echo ""
+            log_warn "--- diff for $relative_path ---"
+            diff --color=auto -u "$full_backup_file_path" "$home_file_path" || true
+        fi
+    done <<< "$tracked_files"
+
+    if [[ "$has_diff" == "false" ]]; then
+        log_success "All tracked files are in sync."
+    fi
+}
+
+
+cmd_update() {
+    log_info "Checking for updates..."
+
+    local script_dir
+    script_dir="$(get_script_dir)"
+
+    if [[ ! -d "$script_dir/.git" ]]; then
+        log_error "Error: '$script_dir' is not a git repository. Cannot update."
+        exit 1
+    fi
+
+    cd "$script_dir"
+
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+    if [[ "$current_branch" != "main" ]]; then
+        log_error "Error: You are not on 'main' branch, cannot update."
+        cd - > /dev/null
+        exit 1
+    fi
+
+    if ! git diff-index --quiet HEAD --; then
+        log_error "Error: You have uncommitted changes in your dotfiles tool."
+        log_warn "Please, commit or stash them before updating."
+        cd - > /dev/null
+        exit 1
+    fi
+
+    local current_version
+    current_version="$(get_script_version)"
+
+    if ! git fetch --quiet origin; then
+        log_error "Error: Failed to fetch from remote."
+        cd - > /dev/null
+        exit 1
+    fi
+
+    if ! git pull --ff-only --quiet; then
+        log_error "Error: Failed to pull changes from remote. You might have local changes that conflict, or remote has diverged."
+        log_warn "Consider stashing your changes, resolving conflicts manually, or using 'git pull'."
+        cd - > /dev/null
+        exit 1
+    fi
+
+    local new_version
+    new_version=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+
+    if [[ "$current_version" != "$new_version" ]]; then
+        log_success "Dotfiles tool updated successfully: $current_version -> $new_version"
+        whats_new "$current_version" "$new_version"
+    else
+        log_success "Your dotfiles tool is already up to date."
+    fi
+
+    cd - > /dev/null
+}
+
+
+cmd_uninstall() {
+    log_warn "⚠️ This will permanently delete the dotfiles tool"
+    read -p "Are you sure you want to continue? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Aborting."
+        exit 1
+    fi
+
+    log_info "Uninstalling dotfiles..."
+    
+    # Remove symlink
+    local BIN_NAME="dotfiles"
+    local TARGET
+    TARGET=$(command -v "$BIN_NAME" || true)
+
+    if [ -n "$TARGET" ]; then
+        if [ -L "$TARGET" ]; then
+            rm "$TARGET"
+            log_success "✅ Uninstalled $TARGET"
+        else
+            log_error "Error: $TARGET is a regular file, not a symlink. Please, remove manually."
+        fi
+    fi
+    
+    # Check if backup should be also deleted
+    local BACKUP_EXISTS=false
+    local REMOVE_BACKUP=false
+    if [ -d "$BACKUP_DIR" ]; then
+        BACKUP_EXISTS=true
+        log_warn "Found configuration backups at: $BACKUP_DIR"
+        read -p "Do you want to delete these backups as well? [y/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            REMOVE_BACKUP=true
+        fi
+    fi
+
+    # Optionally remove backup
+    if [[ "$REMOVE_BACKUP" == true ]]; then
+        rm -rf "$BACKUP_DIR"
+        log_success "✅ Removed backup repository."
+    elif [[ "$BACKUP_EXISTS" == true ]]; then
+        log_info "Preserving backup directory."
+    fi
+
+    log_info ""
+    log_success "Uninstall complete."
+    if [[ "$BACKUP_EXISTS" == true && "$REMOVE_BACKUP" != true ]]; then
+        log_info "To finish, run 'rm -rf $TOOL_DIR' to remove the dotfiles tool"
+    else
+        log_info "To finish, run 'rm -rf $DOTFILES_ROOT' to remove the dotfiles container directory"
+    fi
+    
+    hash -r 2>/dev/null || true
+}
+
+
+cmd_help() {
+    dotfiles_version=$(get_script_version)
+    # spacing is fine! had to escape the backtick 
+    cat <<EOF
+    
+      |        |     _| _)  |
+   _\` |   _ \   _|   」  |  |   -_) (_-<
+ \__,_| \___/ \__| _|   _| _| \___| ___/  $dotfiles_version
+EOF
+    echo ""
+    log_info "Usage: dotfiles <command> [options]"
+    echo ""
+    log_info "Commands:"
+    log_info "  init <remote_url> [--profile <name>]     Initialize a new empty backup repository"
+    log_info "  install <remote_url> [--profile <name>]  Clone an existing backup repository from remote"
+    log_info "  apply [--force]                          Apply dotfiles from backup to your Home directory"
+    log_info "  add <path>...                            Start tracking one or more dotfiles (<path> should be relative to '$HOME')"
+    log_info "  rm <path>...                             Stop tracking one or more dotfiles (<path> should be relative to '$HOME')"
+    log_info "  backup                                   Promote local backup to remote"
+    log_info "  status                                   Show the sync status between Home, backup, and remote"
+    log_info "  diff                                     Show diff between Home and backup dotfiles"
+    log_info "  profile [<name>]                         Switch profiles (branches) or list them"
+    log_info "  pull                                     Fetch and pull remote changes into local backup"
+    log_info "  update                                   Update dotfiles tool"
+    log_info "  uninstall                                Uninstall dotfiles tool and remove backup"
+    log_info "  help                                     Show this help message"
+}
+
+
+main() {
+    local cmd="${1:-help}"
+    shift || true 
+
+    case "$cmd" in
+        init)
+            cmd_init "$@"
+            ;;
+        install)
+            cmd_install "$@"
+            ;;
+        apply)
+            cmd_apply "$@"
+            ;;
+        add)
+            cmd_add "$@"
+            ;;
+        rm)
+            cmd_rm "$@"
+            ;;
+        backup)
+            cmd_backup "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        diff)
+            cmd_diff "$@"
+            ;;
+        profile)
+            cmd_profile "$@"
+            ;;
+        pull)
+            cmd_pull "$@"
+            ;;
+        update)
+            cmd_update "$@"
+            ;;
+        uninstall)
+            cmd_uninstall "$@"
+            ;;
+        help)
+            cmd_help
+            ;;
+        -v|--version|version)
+            log_info "dotfiles version $(get_script_version)"
+            ;;
+        *)
+            log_error "Unknown command: $cmd"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+check_dependencies
+main "$@"
