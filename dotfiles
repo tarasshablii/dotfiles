@@ -46,14 +46,14 @@ sync_safety_check() {
     git fetch > /dev/null 2>&1
 
     # Check if the upstream branch is set
-    if ! git rev-parse --abbrev-ref --symbolic-full-name @{u} > /dev/null 2>&1; then
+    if ! git rev-parse --abbrev-ref --symbolic-full-name '@{u}' > /dev/null 2>&1; then
         # No remote tracking branch, assuming this is a new profile
         cd - > /dev/null
         return
     fi
     
     local remote_commit
-    remote_commit=$(git rev-parse @{u})
+    remote_commit=$(git rev-parse '@{u}')
     
     # If there's no remote commit, it's a new branch, so we are "in sync"
     if [[ -z "$remote_commit" ]]; then
@@ -71,7 +71,7 @@ sync_safety_check() {
     fi
 
     local behind_count
-    behind_count=$(git rev-list --count @..@{u})
+    behind_count=$(git rev-list --count @..'@{u}')
 
     # Out of sync, remote is ahead
     if [[ "$behind_count" -gt 0 ]]; then
@@ -86,7 +86,7 @@ sync_safety_check() {
     fi
 
     local ahead_count
-    ahead_count=$(git rev-list --count @{u}..@)
+    ahead_count=$(git rev-list --count '@{u}'..@)
 
     # Out of sync, local is ahead
     if [[ "$ahead_count" -gt 0 ]]; then
@@ -117,7 +117,8 @@ profile_safety_check() {
 
     if [[ "$current_branch" != "$current_profile" ]]; then
         log_warn "You are on branch '$current_branch', but the last applied profile was '$current_profile'."
-        read -p "Do you want to continue? [y/N] " -n 1 -r
+        echo -n "Do you want to continue? [y/N] "
+        read -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             log_info "Aborting."
@@ -275,7 +276,8 @@ cmd_init() {
     # Safety check for existing directory
     if [[ -d "$BACKUP_DIR" ]]; then
         log_warn "Backup directory '$BACKUP_DIR' already exists."
-        read -p "Do you want to overwrite it? [y/N] " -n 1 -r
+        echo -n "Do you want to overwrite it? [y/N] "
+        read -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             log_info "Aborting. If you want to connect to an existing repository, consider 'dotfiles install' or 'dotfiles apply'."
@@ -352,7 +354,8 @@ cmd_install() {
     # Safety check
     if [ -d "$BACKUP_DIR" ]; then
         log_warn "Backup directory '$BACKUP_DIR' already exists."
-        read -p "Do you want to overwrite it? [y/N] " -n 1 -r
+        echo -n "Do you want to overwrite it? [y/N] "
+        read -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             log_info "Overwriting existing directory..."
@@ -451,7 +454,8 @@ cmd_apply() {
             conflict_resolution="overwrite"
             log_warn "--force flag is set. All conflicts will be overwritten."
         else
-            read -p $'Choose how to handle conflicts: [o]verwrite all, [s]kip all? ' -n 1 -r action
+            echo -n $'Choose how to handle conflicts: [o]verwrite all, [s]kip all? '
+            read -n 1 -r action
             echo
             case "$action" in
                 o|O) conflict_resolution="overwrite" ;;
@@ -509,7 +513,7 @@ cmd_pull() {
     fi
     
     # Check if a remote tracking branch is set
-    if ! git rev-parse --abbrev-ref --symbolic-full-name @{u} > /dev/null 2>&1; then
+    if ! git rev-parse --abbrev-ref --symbolic-full-name '@{u}' > /dev/null 2>&1; then
         log_warn "No upstream branch configured for current branch. Cannot pull."
         cd - > /dev_null
         return
@@ -720,7 +724,8 @@ cmd_backup() {
         for file in "${missing_files[@]}"; do
             echo "  - $file"
         done
-        read -p "Do you want to stop tracking them? [y/N] " -n 1 -r
+        echo -n "Do you want to stop tracking them? [y/N] "
+        read -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             for file in "${missing_files[@]}"; do
@@ -846,7 +851,8 @@ cmd_profile() {
     if [[ "$has_drift" == "true" ]]; then
         log_warn "Inconsistencies detected between your Home directory and the backup."
         log_info "Run 'dotfile status' or 'dotfiles diff' for more details."
-        read -p "Do you want to continue with the profile switch? This might lead to data loss if you haven't backed up. [y/N] " -n 1 -r
+        echo -n "Do you want to continue with the profile switch? This might lead to data loss if you haven't backed up. [y/N] "
+        read -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             log_info "Aborting profile switch."
@@ -865,7 +871,8 @@ cmd_profile() {
         log_success "Successfully switched to profile '$profile_name'."
     else
         log_warn "Profile '$profile_name' does not exist locally."
-        read -p "Do you want to create a new profile '$profile_name'? [y/N] " -n 1 -r
+        echo -n "Do you want to create a new profile '$profile_name'? [y/N] "
+        read -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             log_info "Creating and switching to new profile '$profile_name'..."
@@ -990,7 +997,8 @@ cmd_update() {
 
 cmd_uninstall() {
     log_warn "⚠️ This will permanently delete the dotfiles tool"
-    read -p "Are you sure you want to continue? [y/N] " -n 1 -r
+    echo -n "Are you sure you want to continue? [y/N] "
+    read -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         log_info "Aborting."
@@ -1019,7 +1027,8 @@ cmd_uninstall() {
     if [ -d "$BACKUP_DIR" ]; then
         BACKUP_EXISTS=true
         log_warn "Found configuration backups at: $BACKUP_DIR"
-        read -p "Do you want to delete these backups as well? [y/N] " -n 1 -r
+        echo -n "Do you want to delete these backups as well? [y/N] "
+        read -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             REMOVE_BACKUP=true
